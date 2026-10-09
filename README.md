@@ -1,0 +1,1 @@
+# MagneticEncoder
