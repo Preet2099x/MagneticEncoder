@@ -1,186 +1,121 @@
-#include <SPI.h>
+#include <Arduino.h>
 
 // ==========================================================
-// iC-TW39 + Teensy 4.0
-// Correct continuous SPI Position Read
-// Datasheet Rev B6
-// ==========================================================
-
-#define TW39_CS     10
-#define TW39_NERR    2
-#define TW39_NPRE    3
-
-// TW39 supports Mode 0.
-// Start conservatively at 500 kHz.
-SPISettings TW39_SPI(500000, MSBFIRST, SPI_MODE0);
-
-
-// ----------------------------------------------------------
-// Exactly one 64-bit SPI transaction
-// ----------------------------------------------------------
-void transfer64(const uint8_t tx[8], uint8_t rx[8])
-{
-  SPI.beginTransaction(TW39_SPI);
-
-  digitalWrite(TW39_CS, LOW);
-  delayMicroseconds(2);
-
-  for (int i = 0; i < 8; i++)
-    rx[i] = SPI.transfer(tx[i]);
-
-  delayMicroseconds(2);
-
-  digitalWrite(TW39_CS, HIGH);
-
-  SPI.endTransaction();
-
-  // Datasheet minimum NCS-high time is 200 ns.
-  delayMicroseconds(2);
-}
-
-
-// ----------------------------------------------------------
-// Request Position
-// ----------------------------------------------------------
-bool readTW39Position(uint32_t &angleRaw,
-                      float &angleDeg,
-                      uint32_t &revolution,
-                      uint8_t &status)
-{
-  // ========================================================
-  // CONTROL WORD
-  //
-  // anc = 0
-  // clr = 0
-  // reg = 0
-  // rm  = 4  -> Position Read
-  // wm  = 0  -> Null Write
-  //
-  // Control word:
-  //
-  // bit 15 = anc
-  // bit 14 = clr
-  // bit 13 = reg
-  // bits 12:10 = rm
-  // bits 9:8   = wm
-  // bits 7:0   = 0
-  //
-  // rm = 4 = 100b
-  //
-  // 100 << 10 = 0x1000
-  // ========================================================
-
-  uint8_t positionCommand[8] =
-  {
-    0x10, 0x00,     // Control Word = 0x1000
-    0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00
-  };
-
-  // NULL command used to clock out response
-  uint8_t nullCommand[8] =
-  {
-    0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00
-  };
-
-  uint8_t ignored[8];
-  uint8_t rx[8];
-
-  // --------------------------------------------------------
-  // Transaction #1
-  // Send Position Read command.
-  // Returned data belongs to PREVIOUS command -> ignore.
-  // --------------------------------------------------------
-
-  transfer64(positionCommand, ignored);
-
-
-  // --------------------------------------------------------
-  // Transaction #2
-  // NULL command clocks out Position Read response.
-  // --------------------------------------------------------
-
-  transfer64(nullCommand, rx);
-
-
-  // --------------------------------------------------------
-  // Construct 64-bit response
-  // --------------------------------------------------------
-
-  uint64_t packet = 0;
-
-  for (int i = 0; i < 8; i++)
-  {
-    packet <<= 8;
-    packet |= rx[i];
-  }
-
-
-  // --------------------------------------------------------
-  // Decode Position Read response
-  //
-  // [63:32] Revolution Count
-  // [31:6]  Angle
-  // [5:0]   Status
-  // --------------------------------------------------------
-
-  revolution = (uint32_t)(packet >> 32);
-
-  angleRaw =
-      (uint32_t)((packet >> 6) & 0x03FFFFFFULL);
-
-  status =
-      (uint8_t)(packet & 0x3F);
-
-
-  // 26-bit position
-  angleDeg =
-      ((double)angleRaw * 360.0) /
-      67108864.0;
-
-
-  return true;
-}
-
-
-// ----------------------------------------------------------
-// Sin/Cos ADC Read (rm = 7)
+// iC-TW39 + Teensy 4.0 -- ABZ (quadrature) only
 //
-// Response: [47:32] corrected sin, [31:16] corrected cos
-// (signed 14-bit, sign-extended to 16).
-// Nominal vector amplitude sqrt(sin^2 + cos^2) = 2400;
-// the chip flags 'scamp' outside 50 %..120 % (1200..2880).
-// ----------------------------------------------------------
-void readTW39SinCos(int16_t &sinVal, int16_t &cosVal)
+// A = pin 18, B = pin 19. Z is not wired.
+// Decoded x4 (every edge of A and B) in an interrupt.
+//
+// Serial commands (115200):
+//   z          zero the count
+//   c <n>      set counts per revolution, e.g. c 4096
+//   c          set counts per revolution from the current |count|
+//              (zero with 'z', turn exactly one full revolution, send 'c')
+// ==========================================================
+
+#define ABZ_A 18
+#define ABZ_B 19
+
+volatile int32_t  abzCount  = 0;
+volatile uint32_t abzErrors = 0;   // skipped states (edges too fast / noise)
+volatile uint8_t  abzState  = 0;
+
+// Index = (previous AB << 2) | new AB, AB = (A << 1) | B.
+// Forward sequence 00 -> 01 -> 11 -> 10 counts up.
+static const int8_t QDEC[16] =
 {
-  // rm = 7 = 111b -> 111 << 10 = 0x1C00
-  uint8_t sinCosCommand[8] = { 0x1C, 0x00, 0, 0, 0, 0, 0, 0 };
-  uint8_t nullCommand[8]   = { 0 };
-  uint8_t ignored[8];
-  uint8_t rx[8];
+   0, +1, -1,  0,
+  -1,  0,  0, +1,
+  +1,  0,  0, -1,
+   0, -1, +1,  0
+};
 
-  transfer64(sinCosCommand, ignored);
-  transfer64(nullCommand, rx);
+void abzISR()
+{
+  uint8_t s = (digitalReadFast(ABZ_A) << 1) | digitalReadFast(ABZ_B);
+  int8_t  d = QDEC[(abzState << 2) | s];
 
-  sinVal = (int16_t)((rx[2] << 8) | rx[3]);
-  cosVal = (int16_t)((rx[4] << 8) | rx[5]);
+  if (d == 0 && s != abzState) abzErrors++;
+
+  abzCount += d;
+  abzState = s;
 }
 
 
 // ----------------------------------------------------------
-// Print 6-bit status
+// State
 // ----------------------------------------------------------
 
-void printStatus(uint8_t status)
+// iC-TW39 datasheet Rev B6, p.19: ABZ_RES is in edges per revolution, factory
+// default 4096 (= 1024 AB cycles). Decoded x4 here, so counts/rev = ABZ_RES.
+// Change with 'c <n>' if the chip's EEPROM was programmed differently.
+int32_t countsPerRev = 4096;       // 0 = unknown, angle/RPM shown as n/a
+
+const unsigned long PRINT_MS = 50;
+unsigned long lastPrint = 0;
+int32_t       lastCount = 0;
+
+String cmdLine;
+
+
+int32_t readCount()
 {
-  for (int i = 5; i >= 0; i--)
+  noInterrupts();
+  int32_t c = abzCount;
+  interrupts();
+  return c;
+}
+
+void zeroCount()
+{
+  noInterrupts();
+  abzCount  = 0;
+  abzErrors = 0;
+  interrupts();
+  lastCount = 0;
+}
+
+
+// ----------------------------------------------------------
+// Commands
+// ----------------------------------------------------------
+
+void handleCommand(String line)
+{
+  line.trim();
+  line.toLowerCase();
+  if (line.length() == 0) return;
+
+  char cmd = line.charAt(0);
+
+  if (cmd == 'z')
   {
-    Serial.print((status >> i) & 1);
+    zeroCount();
+    Serial.println("Zeroed");
+    return;
   }
+
+  if (cmd == 'c')
+  {
+    long n = 0;
+
+    if (sscanf(line.c_str() + 1, "%ld", &n) != 1 || n <= 0)
+    {
+      n = abs(readCount());
+      if (n == 0)
+      {
+        Serial.println("Usage: c <counts per rev>  (or 'z', turn one rev, 'c')");
+        return;
+      }
+    }
+
+    countsPerRev = (int32_t)n;
+    Serial.print("Counts per revolution = ");
+    Serial.println(countsPerRev);
+    return;
+  }
+
+  Serial.println("Commands: z = zero, c <n> = counts/rev, c = counts/rev from one turn");
 }
 
 
@@ -191,44 +126,25 @@ void printStatus(uint8_t status)
 void setup()
 {
   Serial.begin(115200);
-
   delay(1500);
 
+  pinMode(ABZ_A, INPUT);
+  pinMode(ABZ_B, INPUT);
+
+  abzState = (digitalReadFast(ABZ_A) << 1) | digitalReadFast(ABZ_B);
+  attachInterrupt(digitalPinToInterrupt(ABZ_A), abzISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ABZ_B), abzISR, CHANGE);
+
   Serial.println();
   Serial.println("======================================");
-  Serial.println(" iC-TW39 SPI POSITION TEST");
+  Serial.println(" iC-TW39 ABZ  (A=18, B=19, x4 decode)");
   Serial.println("======================================");
-
-
-  // CS
-  pinMode(TW39_CS, OUTPUT);
-  digitalWrite(TW39_CS, HIGH);
-
-
-  // NERR
-  pinMode(TW39_NERR, INPUT_PULLUP);
-
-
-  // NPRE
-  //
-  // Your hardware currently works with NPRE HIGH.
-  //
-  pinMode(TW39_NPRE, OUTPUT);
-  digitalWrite(TW39_NPRE, HIGH);
-
-
-  SPI.begin();
-
-  delay(100);
-
-
-  Serial.println("SPI Mode     : MODE 0");
-  Serial.println("SPI Clock    : 500 kHz");
-  Serial.println("Frame        : 64 bit");
-  Serial.println("Position RM  : 4");
+  Serial.println("  z        zero the count");
+  Serial.println("  c <n>    set counts per rev, e.g. c 4096");
+  Serial.println("  c        counts per rev from one full turn since 'z'");
   Serial.println();
-  Serial.println("Rotate magnet...");
-  Serial.println();
+
+  lastPrint = millis();
 }
 
 
@@ -238,55 +154,75 @@ void setup()
 
 void loop()
 {
-  uint32_t raw;
-  uint32_t revolution;
-  uint8_t status;
-  float angle;
+  while (Serial.available())
+  {
+    char ch = (char)Serial.read();
+    if (ch == '\n' || ch == '\r')
+    {
+      handleCommand(cmdLine);
+      cmdLine = "";
+    }
+    else if (cmdLine.length() < 32)
+    {
+      cmdLine += ch;
+    }
+  }
 
+  unsigned long now = millis();
+  if (now - lastPrint < PRINT_MS) return;
 
-  readTW39Position(
-      raw,
-      angle,
-      revolution,
-      status
-  );
+  float dt = (now - lastPrint) / 1000.0f;
+  lastPrint = now;
 
+  noInterrupts();
+  int32_t  count = abzCount;
+  uint32_t err   = abzErrors;
+  interrupts();
 
-  Serial.print("RAW = ");
-  Serial.print(raw);
+  int32_t delta = count - lastCount;
+  lastCount = count;
 
+  float cps = delta / dt;                       // counts per second
+  int   dir = (delta > 0) - (delta < 0);        // +1 / -1 / 0 (stopped)
 
-  Serial.print("   ANGLE = ");
-  Serial.print(angle, 4);
-  Serial.print(" deg");
+  Serial.print("COUNT = ");
+  Serial.print(count);
 
+  if (countsPerRev > 0)
+  {
+    int32_t rev = count / countsPerRev;
+    int32_t pos = count % countsPerRev;
+    if (pos < 0) { pos += countsPerRev; rev--; }
 
-  Serial.print("   REV = ");
-  Serial.print(revolution);
+    Serial.print("   REV = ");
+    Serial.print(rev);
+    Serial.print("   POS = ");
+    Serial.print(pos);
+    Serial.print("/");
+    Serial.print(countsPerRev);
+    Serial.print("   DEG = ");
+    Serial.print(pos * 360.0f / countsPerRev, 2);
+  }
+  else
+  {
+    Serial.print("   REV = n/a   POS = n/a   DEG = n/a");
+  }
 
+  Serial.print("   DIR = ");
+  Serial.print(dir);
 
-  Serial.print("   STATUS = 0b");
-  printStatus(status);
+  Serial.print("   CPS = ");
+  Serial.print(cps, 0);
 
+  Serial.print("   RPM = ");
+  if (countsPerRev > 0) Serial.print(cps * 60.0f / countsPerRev, 2);
+  else                  Serial.print("n/a");
 
-  Serial.print("   NERR=");
-  Serial.print(digitalRead(TW39_NERR));
+  Serial.print("   ERR = ");
+  Serial.print(err);
 
-
-  Serial.print("   NPRE=");
-  Serial.print(digitalRead(TW39_NPRE));
-
-
-  int16_t s, c;
-  readTW39SinCos(s, c);
-
-  Serial.print("   SIN=");
-  Serial.print(s);
-  Serial.print("   COS=");
-  Serial.print(c);
-  Serial.print("   AMP=");
-  Serial.println(sqrtf((float)s * s + (float)c * c), 0);
-
-
-  delay(20);
+  Serial.print("   A=");
+  Serial.print(digitalReadFast(ABZ_A));
+  Serial.print(" B=");
+  Serial.println(digitalReadFast(ABZ_B));
 }
